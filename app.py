@@ -6,11 +6,15 @@ import pandas as pd
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from isodate import parse_duration
+from streamlit_autorefresh import st_autorefresh
 
 # --------------------------- Configuration ---------------------------
 
 # Must be the first Streamlit command in your script:
 st.set_page_config(layout="wide")
+
+# Automatically re-run this script every 2 seconds
+st_autorefresh(interval=2000, limit=None)
 
 # 1. YouTube API Key from Streamlit Secrets
 API_KEY = st.secrets["youtube"]["api_key"]
@@ -29,10 +33,10 @@ CHANNEL_IDS = [
 ]
 
 # Global data store and control flags
-shorts_data = {}  # {video_id: [(timestamp, viewCount, likeCount, commentCount), ...]}
-video_to_channel = {}  # map video_id to channel title for UI display
+shorts_data = {}              # {video_id: [(timestamp, viewCount, likeCount, commentCount), ...]}
+video_to_channel = {}         # map video_id to channel title for UI display
 data_lock = threading.Lock()
-discovery_logs = []  # real-time logs of channel discovery
+discovery_logs = []           # real-time logs of channel discovery
 discovery_logs_lock = threading.Lock()
 no_shorts_flag = False
 error_message = None
@@ -59,6 +63,7 @@ def iso8601_to_seconds(duration_str: str) -> int:
 def get_midnight_ist_utc() -> datetime:
     """
     Return the UTC datetime corresponding to “today’s midnight in IST.”
+    IST = UTC + 5:30 => 00:00 IST = 18:30 UTC (previous day).
     """
     now_utc = datetime.utcnow()
     now_ist = now_utc + timedelta(hours=5, minutes=30)
@@ -94,7 +99,7 @@ def poll_stats_hourly():
     youtube = get_youtube_client()
     today_shorts = []
 
-    # 1. Discover per channel with real-time logging, including channel title
+    # 1. Discovery phase (log channel + channel name)
     for idx, channel_id in enumerate(CHANNEL_IDS, start=1):
         try:
             ch_resp = youtube.channels().list(part="snippet,contentDetails", id=channel_id).execute()
@@ -144,17 +149,17 @@ def poll_stats_hourly():
             with discovery_logs_lock:
                 discovery_logs.append(f"Channel {idx}: No Shorts found today in '{channel_title}'")
 
-    # 2. If no Shorts found across all channels
+    # 2. If no Shorts found
     if not today_shorts:
         no_shorts_flag = True
         return
 
-    # 3. Initialize data storage for discovered Shorts
+    # 3. Initialize data storage
     with data_lock:
         for vid in today_shorts:
             shorts_data.setdefault(vid, [])
 
-    # 4. Immediate stats fetch (so UI can show something right away)
+    # 4. Initial stats fetch
     now_ts = datetime.utcnow().isoformat() + "Z"
     for i in range(0, len(today_shorts), 50):
         batch_ids = today_shorts[i: i + 50]
@@ -218,23 +223,23 @@ start_background_thread()
 # Header
 st.title("📊 YouTube Shorts VPH & Engagement Tracker")
 
-# Show discovery logs in real-time
+# Discovery logs (auto-updates every 2 seconds)
 st.subheader("Discovery Progress")
 with discovery_logs_lock:
     for log in discovery_logs:
         st.write(log)
 
-# Display API error if it occurred
+# Display any API error
 if error_message:
     st.error(error_message)
     st.stop()
 
-# If discovery finished with no Shorts
+# If no Shorts were found
 if no_shorts_flag:
     st.info("No Shorts (≤ 3 minutes) were uploaded today for the selected channels.")
     st.stop()
 
-# Otherwise, if still discovering or initial stats fetch not done
+# If still waiting for initial stats
 with data_lock:
     all_videos = list(shorts_data.keys())
 
@@ -242,7 +247,7 @@ if not all_videos:
     st.info("Waiting for initial stats fetch to complete...")
     st.stop()
 
-# Once data is available, show the dropdown with channel names and video IDs
+# Once data is available, show dropdown
 st.subheader("Available Shorts")
 select_options = [f"{video_to_channel[vid]} → {vid}" for vid in all_videos]
 selected_option = st.selectbox("Select a channel → video ID:", select_options)
@@ -262,7 +267,7 @@ df["timestamp"] = pd.to_datetime(df["timestamp"])
 df["vph"] = df["viewCount"].diff().fillna(0)
 df["engagement_rate"] = (df["likeCount"] + df["commentCount"]) / df["viewCount"]
 
-# Show the selected video's channel name above metrics
+# Show selected video’s channel and metrics
 video_channel = video_to_channel.get(selected_vid, "Unknown Channel")
 st.subheader(f"Metrics for: {video_channel} → {selected_vid}")
 
