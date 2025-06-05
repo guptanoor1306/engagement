@@ -9,15 +9,22 @@ from isodate import parse_duration
 # --------------------------- Configuration ---------------------------
 
 # 1. YouTube API Key from Streamlit Secrets
-# In your streamlit app’s secrets.toml, include:
+# In your Streamlit secrets.toml, include:
 # [youtube]
 # api_key = "YOUR_YOUTUBE_API_KEY"
 API_KEY = st.secrets["youtube"]["api_key"]
 
-# 2. List of Channel IDs to Track (replace with actual channel IDs)
+# 2. List of Channel IDs to Track (your nine channels)
 CHANNEL_IDS = [
-    "UC_x5XG1OV2P6uZZ5FSM9Ttw",  # Example: Google Developers
-    # "UCXXXX...",  # Add your own channel IDs here (8 channels)
+    "UC415bOPUcGSamy543abLmRA",
+    "UCRzYN32xtBf3Yxsx5BvJWJw",
+    "UCVOTBwF0vnSxMRIbfSE_K_g",
+    "UCPk2s5c4R_d-EUUNvFFODoA",
+    "UCwAdQUuPT6laN-AQR17fe1g",
+    "UCA295QVkf9O1RQ8_-s3FVXg",
+    "UCkw1tYo7k8t-Y99bOXuZwhg",
+    "UCxgAuX3XZROujMmGphN_scA",
+    "UCUUlw3anBIkbW9W44Y-eURw",
 ]
 
 # Global data store: { video_id: [ (timestamp, viewCount, likeCount, commentCount), ... ] }
@@ -26,7 +33,7 @@ data_lock = threading.Lock()
 
 # ----------------------- Helper Functions ----------------------------
 
-@st.experimental_singleton
+@st.cache(allow_output_mutation=True)
 def get_youtube_client():
     """Initialize and cache the YouTube Data API client."""
     return build("youtube", "v3", developerKey=API_KEY)
@@ -46,7 +53,7 @@ def iso8601_to_seconds(duration_str: str) -> int:
 
 def get_midnight_ist_utc() -> datetime:
     """
-    Return the UTC datetime corresponding to “today’s midnight in IST”.
+    Return the UTC datetime corresponding to “today’s midnight in IST.”
     IST = UTC + 5:30
     So 00:00 IST = 18:30 UTC (previous day).
     """
@@ -96,7 +103,7 @@ def discover_today_shorts() -> list:
             pl_resp = pl_req.execute()
             for item in pl_resp["items"]:
                 vid_id = item["snippet"]["resourceId"]["videoId"]
-                published_at = item["snippet"]["publishedAt"]  # e.g. "2025-06-05T01:23:45Z"
+                published_at = item["snippet"]["publishedAt"]  # e.g., "2025-06-05T01:23:45Z"
 
                 # Only consider if it was published “today in IST”
                 if not is_within_today(published_at):
@@ -156,7 +163,7 @@ def poll_stats_hourly():
         time.sleep(seconds_til_next_hour)
 
 
-@st.experimental_singleton
+@st.cache(allow_output_mutation=True)
 def start_background_thread():
     """
     Start the polling thread (only once per Streamlit session).
