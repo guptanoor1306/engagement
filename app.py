@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta
 import pandas as pd
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from isodate import parse_duration
 
 # --------------------------- Configuration ---------------------------
@@ -30,9 +31,11 @@ CHANNEL_IDS = [
     "UCUUlw3anBIkbW9W44Y-eURw",
 ]
 
-# Global data store: { video_id: [ (timestamp, viewCount, likeCount, commentCount), ... ] }
-shorts_data = {}
+# Global data store and flags
+shorts_data = {}  # {video_id: [(timestamp, viewCount, likeCount, commentCount), ...]}
 data_lock = threading.Lock()
+no_shorts_flag = False
+error_message = None
 
 # ----------------------- Helper Functions ----------------------------
 
@@ -74,11 +77,9 @@ def is_within_today(published_at_str: str) -> bool:
     Given a video's publishedAt string (ISO 8601, UTC), return True if it falls within “today in IST.”
     """
     try:
-        # Example published_at_str: "2025-06-05T01:23:45Z"
         pub_dt = datetime.fromisoformat(published_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception:
         return False
-
     midnight_utc = get_midnight_ist_utc()
     next_midnight_utc = midnight_utc + timedelta(hours=24)
     return midnight_utc <= pub_dt < next_midnight_utc
@@ -86,7 +87,7 @@ def is_within_today(published_at_str: str) -> bool:
 
 def discover_today_shorts() -> list:
     """
-    Discover all Shorts (duration < 60 s) published “today in IST” for each channel in CHANNEL_IDS.
+    Discover all Shorts (duration <= 180 s) published “today in IST” for each channel in CHANNEL_IDS.
     Returns a list of video IDs.
     """
     youtube = get_youtube_client()
@@ -106,17 +107,16 @@ def discover_today_shorts() -> list:
             pl_resp = pl_req.execute()
             for item in pl_resp["items"]:
                 vid_id = item["snippet"]["resourceId"]["videoId"]
-                published_at = item["snippet"]["publishedAt"]  # e.g., "2025-06-05T01:23:45Z"
+                published_at = item["snippet"]["publishedAt"]
 
-                # Only consider if it was published “today in IST”
                 if not is_within_today(published_at):
                     continue
 
-                # Fetch its duration to confirm it’s a Short (< 60 seconds)
+                # Fetch duration to confirm it's <= 180 seconds
                 cd_resp = youtube.videos().list(part="contentDetails", id=vid_id).execute()
                 duration_str = cd_resp["items"][0]["contentDetails"]["duration"]
                 duration_secs = iso8601_to_seconds(duration_str)
-                if duration_secs < 60:
+                if duration_secs <= 180:
                     today_shorts.append(vid_id)
 
             pl_req = youtube.playlistItems().list_next(pl_req, pl_resp)
@@ -127,12 +127,24 @@ def discover_today_shorts() -> list:
 def poll_stats_hourly():
     """
     Background thread function:
-    1. Discovers all “today’s Shorts” (duration < 60 s).
-    2. Once per hour, fetches their statistics (viewCount, likeCount, commentCount).
-    3. Stores each snapshot into the global shorts_data dict.
+    - Discovers all today's Shorts.
+    - If no Shorts, set no_shorts_flag.
+    - If quota or API error, set error_message.
+    - Otherwise, polls stats every hour.
     """
+    global no_shorts_flag, error_message
+
     youtube = get_youtube_client()
-    today_shorts = discover_today_shorts()
+
+    try:
+        today_shorts = discover_today_shorts()
+    except HttpError as e:
+        error_message = f"YouTube API Error: {e}"
+        return
+
+    if not today_shorts:
+        no_shorts_flag = True
+        return
 
     # Initialize data structure
     with data_lock:
@@ -142,12 +154,15 @@ def poll_stats_hourly():
     # Poll hourly
     while True:
         now_ts = datetime.utcnow().isoformat() + "Z"
-        # Batch requests in groups of 50 IDs
         for i in range(0, len(today_shorts), 50):
-            batch_ids = today_shorts[i : i + 50]
-            stats_resp = youtube.videos().list(
-                part="statistics", id=",".join(batch_ids)
-            ).execute()
+            batch_ids = today_shorts[i: i + 50]
+            try:
+                stats_resp = youtube.videos().list(
+                    part="statistics", id=",".join(batch_ids)
+                ).execute()
+            except HttpError as e:
+                error_message = f"YouTube API Error: {e}"
+                return
 
             with data_lock:
                 for vid in stats_resp["items"]:
@@ -160,7 +175,6 @@ def poll_stats_hourly():
                     )
                     shorts_data[vid].append(row)
 
-        # Compute how many seconds until the next top of the hour
         now_dt = datetime.utcnow()
         seconds_til_next_hour = 3600 - (now_dt.minute * 60 + now_dt.second)
         time.sleep(seconds_til_next_hour)
@@ -170,7 +184,6 @@ def poll_stats_hourly():
 def start_background_thread():
     """
     Start the polling thread (only once per Streamlit session).
-    This thread will run `poll_stats_hourly()` in daemon mode.
     """
     thread = threading.Thread(target=poll_stats_hourly, daemon=True)
     thread.start()
@@ -182,15 +195,26 @@ def start_background_thread():
 # Kick off the polling thread (only on first run)
 start_background_thread()
 
-st.title("📊 YouTube Shorts VPH & Engagement Tracker")
+# 1. If there is an API error, show it
+if error_message:
+    st.error(error_message)
+    st.stop()
 
-# Wait for the background thread to populate at least one entry
+# 2. If no Shorts were uploaded today, show that message
+if no_shorts_flag:
+    st.info("No Shorts (<= 3 minutes) were uploaded today for the selected channels.")
+    st.stop()
+
+# 3. Otherwise, if discovery is still in progress, wait
 with data_lock:
     all_videos = list(shorts_data.keys())
 
 if not all_videos:
     st.info("Waiting for background thread to discover today’s Shorts and capture stats…")
     st.stop()
+
+# 4. If we have data, show the dashboard
+st.title("📊 YouTube Shorts VPH & Engagement Tracker")
 
 # Sidebar: pick which video to inspect
 selected_vid = st.sidebar.selectbox("Select a video ID:", all_videos)
