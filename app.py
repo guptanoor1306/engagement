@@ -19,7 +19,7 @@ st_autorefresh(interval=2000, limit=None)
 # 1. YouTube API Key from Streamlit Secrets
 API_KEY = st.secrets["youtube"]["api_key"]
 
-# 2. List of Channel IDs to Track
+# 2. List of Channel IDs to Track (your nine channels)
 CHANNEL_IDS = [
     "UC415bOPUcGSamy543abLmRA",
     "UCRzYN32xtBf3Yxsx5BvJWJw",
@@ -32,39 +32,46 @@ CHANNEL_IDS = [
     "UCUUlw3anBIkbW9W44Y-eURw",
 ]
 
-# Initialize session state if not already
+# Initialize session state for persistent data
 if "discovered" not in st.session_state:
     st.session_state.discovered = False
-    st.session_state.shorts_data = {}           # {video_id: [(timestamp, viewCount, likeCount, commentCount), ...]}
+    st.session_state.shorts_data = {}           # {video_id: [...stats rows...]}
     st.session_state.video_to_channel = {}       # {video_id: channel_title}
-    st.session_state.logs = []                   # Discovery logs
+    st.session_state.logs = []                   # discovery logs
     st.session_state.no_shorts = False
     st.session_state.error = None
 
 # ----------------------- Helper Functions ----------------------------
 
-@st.cache_resource
-def get_youtube_client():
+def create_youtube_client():
+    """Instantiate a new YouTube Data API client per call."""
     return build("youtube", "v3", developerKey=API_KEY)
 
-
 def iso8601_to_seconds(duration_str: str) -> int:
+    """
+    Convert an ISO 8601 duration (e.g., "PT45S") into total seconds.
+    """
     try:
         duration = parse_duration(duration_str)
         return int(duration.total_seconds())
     except:
         return 0
 
-
 def get_midnight_ist_utc() -> datetime:
+    """
+    Return the UTC datetime corresponding to “today’s midnight in IST.”
+    IST = UTC + 5:30 => 00:00 IST = 18:30 UTC (previous day).
+    """
     now_utc = datetime.utcnow()
     now_ist = now_utc + timedelta(hours=5, minutes=30)
     today_ist_date = now_ist.date()
     midnight_ist = datetime(today_ist_date.year, today_ist_date.month, today_ist_date.day, 0, 0)
     return midnight_ist - timedelta(hours=5, minutes=30)
 
-
 def is_within_today(published_at_str: str) -> bool:
+    """
+    Return True if a video's publishedAt (UTC) falls within “today in IST.”
+    """
     try:
         pub_dt = datetime.fromisoformat(published_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
     except:
@@ -73,14 +80,20 @@ def is_within_today(published_at_str: str) -> bool:
     next_midnight = midnight_utc + timedelta(hours=24)
     return midnight_utc <= pub_dt < next_midnight
 
-
 def run_discovery_and_initial_fetch():
-    youtube = get_youtube_client()
+    """
+    Runs once: discovers today's Shorts (<= 3 mins), logs per channel, and fetches initial stats.
+    Each function call uses its own API client instance.
+    """
+    youtube = create_youtube_client()
     today_shorts = []
 
     for idx, channel_id in enumerate(CHANNEL_IDS, start=1):
+        # Fetch channel title and uploads playlist ID
         try:
-            ch_resp = youtube.channels().list(part="snippet,contentDetails", id=channel_id).execute()
+            ch_resp = youtube.channels().list(
+                part="snippet,contentDetails", id=channel_id
+            ).execute()
             channel_title = ch_resp["items"][0]["snippet"]["title"]
             uploads_playlist = ch_resp["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
         except HttpError as e:
@@ -90,7 +103,7 @@ def run_discovery_and_initial_fetch():
         st.session_state.logs.append(f"Checking channel {idx}/{len(CHANNEL_IDS)}: {channel_title}")
         channel_shorts = []
 
-        # Page through the uploads playlist
+        # Page through uploads playlist
         pl_req = youtube.playlistItems().list(part="snippet", playlistId=uploads_playlist, maxResults=50)
         while pl_req:
             try:
@@ -126,81 +139,87 @@ def run_discovery_and_initial_fetch():
         st.session_state.no_shorts = True
         return
 
-    # Initialize data structure
+    # Initialize data store
     for vid in today_shorts:
         st.session_state.shorts_data.setdefault(vid, [])
 
     # Initial stats fetch
     now_ts = datetime.utcnow().isoformat() + "Z"
     for i in range(0, len(today_shorts), 50):
-        batch = today_shorts[i : i + 50]
+        batch = today_shorts[i:i+50]
         try:
             stats_resp = youtube.videos().list(part="statistics", id=",".join(batch)).execute()
         except HttpError as e:
             st.session_state.error = f"API Error (initial stats): {e}"
             return
-        for item in stats_resp["items"]:
-            stats = item["statistics"]
+        for vid_item in stats_resp["items"]:
+            vid = vid_item["id"]
+            stats = vid_item["statistics"]
             row = (
                 now_ts,
                 int(stats.get("viewCount", 0)),
                 int(stats.get("likeCount", 0)),
                 int(stats.get("commentCount", 0)),
             )
-            st.session_state.shorts_data[item["id"]].append(row)
+            st.session_state.shorts_data[vid].append(row)
 
     st.session_state.discovered = True
 
-
 def poll_stats_background():
-    youtube = get_youtube_client()
+    """
+    Background thread: polls YouTube stats hourly. Each thread call uses its own client instance.
+    """
     while True:
-        if not st.session_state.discovered:
+        if not st.session_state.discovered or st.session_state.error:
             time.sleep(5)
             continue
+
+        youtube = create_youtube_client()
         vids = list(st.session_state.shorts_data.keys())
         now_ts = datetime.utcnow().isoformat() + "Z"
         for i in range(0, len(vids), 50):
-            batch = vids[i : i + 50]
+            batch = vids[i:i+50]
             try:
                 stats_resp = youtube.videos().list(part="statistics", id=",".join(batch)).execute()
             except HttpError as e:
                 st.session_state.error = f"API Error (polling): {e}"
                 return
-            for item in stats_resp["items"]:
-                stats = item["statistics"]
+            for vid_item in stats_resp["items"]:
+                vid = vid_item["id"]
+                stats = vid_item["statistics"]
                 row = (
                     now_ts,
                     int(stats.get("viewCount", 0)),
                     int(stats.get("likeCount", 0)),
                     int(stats.get("commentCount", 0)),
                 )
-                st.session_state.shorts_data[item["id"]].append(row)
-        # Sleep until next hour
+                st.session_state.shorts_data[vid].append(row)
+
+        # Sleep until the next top of the hour
         now = datetime.utcnow()
         secs = 3600 - (now.minute * 60 + now.second)
         time.sleep(secs)
 
-# Start background polling thread once
+# Launch background polling thread once
 if "poll_thread" not in st.session_state:
     t = threading.Thread(target=poll_stats_background, daemon=True)
     t.start()
     st.session_state.poll_thread = True
 
-# Run discovery + initial fetch once
-if not st.session_state.discovered and st.session_state.error is None:
+# Run discovery and initial fetch once
+if not st.session_state.discovered and not st.session_state.error:
     run_discovery_and_initial_fetch()
 
 # ----------------------------- UI Rendering -----------------------------
 
 st.title("📊 YouTube Shorts VPH & Engagement Tracker")
 
-# Discovery logs
+# Show discovery logs
 st.subheader("Discovery Progress")
 for log in st.session_state.logs:
     st.write(log)
 
-# Handle errors or no-shorts
+# Show any error or no-shorts message
 if st.session_state.error:
     st.error(st.session_state.error)
     st.stop()
@@ -209,6 +228,7 @@ if st.session_state.no_shorts:
     st.info("No Shorts (≤ 3 minutes) were uploaded today for the selected channels.")
     st.stop()
 
+# If still waiting for initial stats
 if not st.session_state.discovered:
     st.info("Waiting for initial stats fetch to complete...")
     st.stop()
