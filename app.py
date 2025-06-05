@@ -13,9 +13,6 @@ from isodate import parse_duration
 st.set_page_config(layout="wide")
 
 # 1. YouTube API Key from Streamlit Secrets
-# In your Streamlit secrets.toml, include:
-# [youtube]
-# api_key = "YOUR_YOUTUBE_API_KEY"
 API_KEY = st.secrets["youtube"]["api_key"]
 
 # 2. List of Channel IDs to Track (your nine channels)
@@ -31,9 +28,12 @@ CHANNEL_IDS = [
     "UCUUlw3anBIkbW9W44Y-eURw",
 ]
 
-# Global data store and flags
+# Global data store and control flags
 shorts_data = {}  # {video_id: [(timestamp, viewCount, likeCount, commentCount), ...]}
+video_to_channel = {}  # map video_id to channel title for UI display
 data_lock = threading.Lock()
+discovery_logs = []  # real-time logs of channel discovery
+discovery_logs_lock = threading.Lock()
 no_shorts_flag = False
 error_message = None
 
@@ -48,7 +48,6 @@ def get_youtube_client():
 def iso8601_to_seconds(duration_str: str) -> int:
     """
     Convert an ISO 8601 duration (e.g., "PT45S") into total seconds.
-    Uses isodate.parse_duration under the hood.
     """
     try:
         duration = parse_duration(duration_str)
@@ -60,21 +59,18 @@ def iso8601_to_seconds(duration_str: str) -> int:
 def get_midnight_ist_utc() -> datetime:
     """
     Return the UTC datetime corresponding to “today’s midnight in IST.”
-    IST = UTC + 5:30
-    So 00:00 IST = 18:30 UTC (previous day).
     """
     now_utc = datetime.utcnow()
     now_ist = now_utc + timedelta(hours=5, minutes=30)
     today_ist_date = now_ist.date()
     midnight_ist = datetime(today_ist_date.year, today_ist_date.month, today_ist_date.day, 0, 0)
-    # Convert that to UTC
     midnight_utc = midnight_ist - timedelta(hours=5, minutes=30)
     return midnight_utc
 
 
 def is_within_today(published_at_str: str) -> bool:
     """
-    Given a video's publishedAt string (ISO 8601, UTC), return True if it falls within “today in IST.”
+    Return True if a video's publishedAt (UTC) falls within “today in IST.”
     """
     try:
         pub_dt = datetime.fromisoformat(published_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
@@ -85,83 +81,109 @@ def is_within_today(published_at_str: str) -> bool:
     return midnight_utc <= pub_dt < next_midnight_utc
 
 
-def discover_today_shorts() -> list:
-    """
-    Discover all Shorts (duration <= 180 s) published “today in IST” for each channel in CHANNEL_IDS.
-    Returns a list of video IDs.
-    """
-    youtube = get_youtube_client()
-    today_shorts = []
-
-    for channel_id in CHANNEL_IDS:
-        # 1. Get the channel’s “uploads” playlist
-        ch_resp = youtube.channels().list(part="contentDetails", id=channel_id).execute()
-        uploads_playlist = ch_resp["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
-
-        # 2. Page through the uploads playlist, 50 items at a time
-        pl_req = youtube.playlistItems().list(
-            part="snippet", playlistId=uploads_playlist, maxResults=50
-        )
-
-        while pl_req:
-            pl_resp = pl_req.execute()
-            for item in pl_resp["items"]:
-                vid_id = item["snippet"]["resourceId"]["videoId"]
-                published_at = item["snippet"]["publishedAt"]
-
-                if not is_within_today(published_at):
-                    continue
-
-                # Fetch duration to confirm it's <= 180 seconds
-                cd_resp = youtube.videos().list(part="contentDetails", id=vid_id).execute()
-                duration_str = cd_resp["items"][0]["contentDetails"]["duration"]
-                duration_secs = iso8601_to_seconds(duration_str)
-                if duration_secs <= 180:
-                    today_shorts.append(vid_id)
-
-            pl_req = youtube.playlistItems().list_next(pl_req, pl_resp)
-
-    return today_shorts
-
-
 def poll_stats_hourly():
     """
     Background thread function:
-    - Discovers all today's Shorts.
-    - If no Shorts, set no_shorts_flag.
-    - If quota or API error, set error_message.
-    - Otherwise, polls stats every hour.
+    1. Discovers all today's Shorts (<= 3 minutes), logging per channel.
+    2. If no Shorts, set no_shorts_flag and exit.
+    3. If any API error, set error_message and exit.
+    4. Otherwise, performs one immediate stats fetch, then polls every hour.
     """
     global no_shorts_flag, error_message
 
     youtube = get_youtube_client()
+    today_shorts = []
 
-    try:
-        today_shorts = discover_today_shorts()
-    except HttpError as e:
-        error_message = f"YouTube API Error: {e}"
-        return
+    # 1. Discover per channel with real-time logging, including channel title
+    for idx, channel_id in enumerate(CHANNEL_IDS, start=1):
+        try:
+            ch_resp = youtube.channels().list(part="snippet,contentDetails", id=channel_id).execute()
+            channel_title = ch_resp["items"][0]["snippet"]["title"]
+            uploads_playlist = ch_resp["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+        except HttpError as e:
+            error_message = f"YouTube API Error (channel fetch): {e}"
+            return
 
+        with discovery_logs_lock:
+            discovery_logs.append(f"Checking channel {idx}/{len(CHANNEL_IDS)}: {channel_title}")
+
+        channel_shorts = []
+        pl_req = youtube.playlistItems().list(part="snippet", playlistId=uploads_playlist, maxResults=50)
+        while pl_req:
+            try:
+                pl_resp = pl_req.execute()
+            except HttpError as e:
+                error_message = f"YouTube API Error (playlistItems): {e}"
+                return
+
+            for item in pl_resp["items"]:
+                vid_id = item["snippet"]["resourceId"]["videoId"]
+                published_at = item["snippet"]["publishedAt"]
+                if not is_within_today(published_at):
+                    continue
+
+                try:
+                    cd_resp = youtube.videos().list(part="contentDetails", id=vid_id).execute()
+                except HttpError as e:
+                    error_message = f"YouTube API Error (contentDetails): {e}"
+                    return
+
+                duration_str = cd_resp["items"][0]["contentDetails"]["duration"]
+                duration_secs = iso8601_to_seconds(duration_str)
+                if duration_secs <= 180:
+                    channel_shorts.append(vid_id)
+                    video_to_channel[vid_id] = channel_title
+
+            pl_req = youtube.playlistItems().list_next(pl_req, pl_resp)
+
+        if channel_shorts:
+            with discovery_logs_lock:
+                discovery_logs.append(f"Channel {idx}: Found {len(channel_shorts)} Shorts in '{channel_title}'")
+            today_shorts.extend(channel_shorts)
+        else:
+            with discovery_logs_lock:
+                discovery_logs.append(f"Channel {idx}: No Shorts found today in '{channel_title}'")
+
+    # 2. If no Shorts found across all channels
     if not today_shorts:
         no_shorts_flag = True
         return
 
-    # Initialize data structure
+    # 3. Initialize data storage for discovered Shorts
     with data_lock:
         for vid in today_shorts:
             shorts_data.setdefault(vid, [])
 
-    # Poll hourly
+    # 4. Immediate stats fetch (so UI can show something right away)
+    now_ts = datetime.utcnow().isoformat() + "Z"
+    for i in range(0, len(today_shorts), 50):
+        batch_ids = today_shorts[i: i + 50]
+        try:
+            stats_resp = youtube.videos().list(part="statistics", id=",".join(batch_ids)).execute()
+        except HttpError as e:
+            error_message = f"YouTube API Error (initial stats fetch): {e}"
+            return
+
+        with data_lock:
+            for vid in stats_resp["items"]:
+                stats = vid["statistics"]
+                row = (
+                    now_ts,
+                    int(stats.get("viewCount", 0)),
+                    int(stats.get("likeCount", 0)),
+                    int(stats.get("commentCount", 0)),
+                )
+                shorts_data[vid].append(row)
+
+    # 5. Poll every hour
     while True:
         now_ts = datetime.utcnow().isoformat() + "Z"
         for i in range(0, len(today_shorts), 50):
             batch_ids = today_shorts[i: i + 50]
             try:
-                stats_resp = youtube.videos().list(
-                    part="statistics", id=",".join(batch_ids)
-                ).execute()
+                stats_resp = youtube.videos().list(part="statistics", id=",".join(batch_ids)).execute()
             except HttpError as e:
-                error_message = f"YouTube API Error: {e}"
+                error_message = f"YouTube API Error (polling stats): {e}"
                 return
 
             with data_lock:
@@ -182,9 +204,7 @@ def poll_stats_hourly():
 
 @st.cache_resource
 def start_background_thread():
-    """
-    Start the polling thread (only once per Streamlit session).
-    """
+    """Starts the polling thread once per Streamlit session."""
     thread = threading.Thread(target=poll_stats_hourly, daemon=True)
     thread.start()
     return thread
@@ -192,34 +212,42 @@ def start_background_thread():
 
 # ----------------------------- Main UI -------------------------------
 
-# Kick off the polling thread (only on first run)
+# Start the background thread
 start_background_thread()
 
-# 1. If there is an API error, show it
+# Header
+st.title("📊 YouTube Shorts VPH & Engagement Tracker")
+
+# Show discovery logs in real-time
+st.subheader("Discovery Progress")
+with discovery_logs_lock:
+    for log in discovery_logs:
+        st.write(log)
+
+# Display API error if it occurred
 if error_message:
     st.error(error_message)
     st.stop()
 
-# 2. If no Shorts were uploaded today, show that message
+# If discovery finished with no Shorts
 if no_shorts_flag:
-    st.info("No Shorts (<= 3 minutes) were uploaded today for the selected channels.")
+    st.info("No Shorts (≤ 3 minutes) were uploaded today for the selected channels.")
     st.stop()
 
-# 3. Otherwise, if discovery is still in progress, wait
+# Otherwise, if still discovering or initial stats fetch not done
 with data_lock:
     all_videos = list(shorts_data.keys())
 
 if not all_videos:
-    st.info("Waiting for background thread to discover today’s Shorts and capture stats…")
+    st.info("Waiting for initial stats fetch to complete...")
     st.stop()
 
-# 4. If we have data, show the dashboard
-st.title("📊 YouTube Shorts VPH & Engagement Tracker")
+# Once data is available, show the dropdown with channel names and video IDs
+st.subheader("Available Shorts")
+select_options = [f"{video_to_channel[vid]} → {vid}" for vid in all_videos]
+selected_option = st.selectbox("Select a channel → video ID:", select_options)
+selected_vid = selected_option.split(" → ")[1]
 
-# Sidebar: pick which video to inspect
-selected_vid = st.sidebar.selectbox("Select a video ID:", all_videos)
-
-# Build a DataFrame of that video’s stats
 with data_lock:
     stats_rows = shorts_data[selected_vid].copy()
 
@@ -234,8 +262,10 @@ df["timestamp"] = pd.to_datetime(df["timestamp"])
 df["vph"] = df["viewCount"].diff().fillna(0)
 df["engagement_rate"] = (df["likeCount"] + df["commentCount"]) / df["viewCount"]
 
-# Display the latest metrics
-st.subheader("Latest Metrics")
+# Show the selected video's channel name above metrics
+video_channel = video_to_channel.get(selected_vid, "Unknown Channel")
+st.subheader(f"Metrics for: {video_channel} → {selected_vid}")
+
 latest = df.iloc[-1]
 st.markdown(f"""
 - **Timestamp (UTC):** {latest['timestamp']}
@@ -244,16 +274,11 @@ st.markdown(f"""
 - **Approximate Engagement Rate:** {latest['engagement_rate']:.2%}
 """)
 
-# Plot VPH over time
 st.subheader("VPH Over Time")
-vph_chart = df.set_index("timestamp")["vph"]
-st.line_chart(vph_chart)
+st.line_chart(df.set_index("timestamp")["vph"])
 
-# Plot Engagement Rate over time
 st.subheader("Engagement Rate Over Time")
-eng_chart = df.set_index("timestamp")["engagement_rate"]
-st.line_chart(eng_chart)
+st.line_chart(df.set_index("timestamp")["engagement_rate"])
 
-# Show raw data
 st.subheader("Raw Data Table")
 st.dataframe(df.reset_index(drop=True), use_container_width=True)
