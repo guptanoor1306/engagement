@@ -1,4 +1,5 @@
 streamlit
+streamlit-autorefresh
 google-api-python-client
 pandas
 isodate
