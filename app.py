@@ -1,7 +1,7 @@
 import streamlit as st
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -59,30 +59,31 @@ def iso8601_to_seconds(duration_str: str) -> int:
 
 def get_midnight_ist_utc() -> datetime:
     """
-    Return the UTC datetime corresponding to “today’s midnight in IST.”
+    Return a timezone-aware UTC datetime corresponding to today’s midnight in IST.
     IST = UTC + 5:30 => 00:00 IST = 18:30 UTC (previous day).
     """
-    now_utc = datetime.utcnow()
-    now_ist = now_utc + timedelta(hours=5, minutes=30)
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(timezone(timedelta(hours=5, minutes=30)))
     today_ist_date = now_ist.date()
-    midnight_ist = datetime(today_ist_date.year, today_ist_date.month, today_ist_date.day, 0, 0)
-    return midnight_ist - timedelta(hours=5, minutes=30)
+    midnight_ist = datetime(today_ist_date.year, today_ist_date.month, today_ist_date.day, 0, 0,
+                            tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    return midnight_ist.astimezone(timezone.utc)
 
 def is_within_today(published_at_str: str) -> bool:
     """
-    Return True if a video's publishedAt (UTC) falls within “today in IST.”
+    Return True if a video's publishedAt (UTC) falls within ‘today in IST.’
     """
     try:
-        pub_dt = datetime.fromisoformat(published_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        pub_dt = datetime.fromisoformat(published_at_str.replace("Z", "+00:00")).astimezone(timezone.utc)
     except:
         return False
     midnight_utc = get_midnight_ist_utc()
-    next_midnight = midnight_utc + timedelta(hours=24)
-    return midnight_utc <= pub_dt < next_midnight
+    next_midnight_utc = midnight_utc + timedelta(hours=24)
+    return midnight_utc <= pub_dt < next_midnight_utc
 
 def run_discovery_and_initial_fetch():
     """
-    Runs once: discovers today's Shorts (<= 3 mins), logs per channel, and fetches initial stats.
+    Runs once: discovers today’s Shorts (<= 3 minutes), logs per channel, and fetches initial stats.
     Each function call uses its own API client instance.
     """
     youtube = create_youtube_client()
@@ -144,9 +145,9 @@ def run_discovery_and_initial_fetch():
         st.session_state.shorts_data.setdefault(vid, [])
 
     # Initial stats fetch
-    now_ts = datetime.utcnow().isoformat() + "Z"
+    now_ts = datetime.now(timezone.utc).isoformat()
     for i in range(0, len(today_shorts), 50):
-        batch = today_shorts[i:i+50]
+        batch = today_shorts[i : i + 50]
         try:
             stats_resp = youtube.videos().list(part="statistics", id=",".join(batch)).execute()
         except HttpError as e:
@@ -176,9 +177,9 @@ def poll_stats_background():
 
         youtube = create_youtube_client()
         vids = list(st.session_state.shorts_data.keys())
-        now_ts = datetime.utcnow().isoformat() + "Z"
+        now_ts = datetime.now(timezone.utc).isoformat()
         for i in range(0, len(vids), 50):
-            batch = vids[i:i+50]
+            batch = vids[i : i + 50]
             try:
                 stats_resp = youtube.videos().list(part="statistics", id=",".join(batch)).execute()
             except HttpError as e:
@@ -196,9 +197,9 @@ def poll_stats_background():
                 st.session_state.shorts_data[vid].append(row)
 
         # Sleep until the next top of the hour
-        now = datetime.utcnow()
-        secs = 3600 - (now.minute * 60 + now.second)
-        time.sleep(secs)
+        now = datetime.now(timezone.utc)
+        seconds_until_next_hour = 3600 - (now.minute * 60 + now.second)
+        time.sleep(seconds_until_next_hour)
 
 # Launch background polling thread once
 if "poll_thread" not in st.session_state:
