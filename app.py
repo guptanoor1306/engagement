@@ -8,6 +8,9 @@ from isodate import parse_duration
 
 # --------------------------- Configuration ---------------------------
 
+# Must be the first Streamlit command in your script:
+st.set_page_config(layout="wide")
+
 # 1. YouTube API Key from Streamlit Secrets
 # In your Streamlit secrets.toml, include:
 # [youtube]
@@ -33,7 +36,7 @@ data_lock = threading.Lock()
 
 # ----------------------- Helper Functions ----------------------------
 
-@st.cache(allow_output_mutation=True)
+@st.cache_resource
 def get_youtube_client():
     """Initialize and cache the YouTube Data API client."""
     return build("youtube", "v3", developerKey=API_KEY)
@@ -163,7 +166,7 @@ def poll_stats_hourly():
         time.sleep(seconds_til_next_hour)
 
 
-@st.cache(allow_output_mutation=True)
+@st.cache_resource
 def start_background_thread():
     """
     Start the polling thread (only once per Streamlit session).
@@ -179,7 +182,6 @@ def start_background_thread():
 # Kick off the polling thread (only on first run)
 start_background_thread()
 
-st.set_page_config(layout="wide")
 st.title("📊 YouTube Shorts VPH & Engagement Tracker")
 
 # Wait for the background thread to populate at least one entry
